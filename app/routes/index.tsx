@@ -16,6 +16,9 @@ export default function Index() {
       <h1>Remix SuperJSON</h1>
       <pre>{JSON.stringify(data, null, 2)}</pre>
       <p>Today is {data.today.toLocaleDateString()}</p>
+      <p>
+        <a href="https://github.com/kiliman/remix-superjson">GitHub</a>
+      </p>
     </div>
   )
 }

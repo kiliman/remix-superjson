@@ -6,6 +6,8 @@ your loaders and get the correct types in your route component.
 Thanks to the type inference support added to Remix v1.6.5, you also
 get full fidelty type inference.
 
+Demo: https://remix-superjson-production.up.railway.app
+
 ```ts
 export async function loader({ request }: LoaderArgs) {
   return superjson(
