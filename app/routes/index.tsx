@@ -1,7 +1,11 @@
 import type { LoaderArgs } from '@remix-run/node'
-import { superjson, useSuperLoaderData } from '~/utils/data'
+import { redirect, superjson, useSuperLoaderData } from '~/utils/data'
 
 export async function loader({ request }: LoaderArgs) {
+  var url = new URL(request.url)
+  if (url.searchParams.has('redirect')) {
+    return redirect('/', { headers: { 'set-cookie': 'superjson=true' } })
+  }
   return superjson(
     { greeting: 'hello', today: new Date() },
     { headers: { 'x-superjson': 'true' } },
