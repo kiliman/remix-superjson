@@ -4,7 +4,7 @@ This sample shows how to use the [`superjson`](https://www.npmjs.com/package/sup
 your loaders and get the correct types in your route component.
 
 Thanks to the type inference support added to Remix v1.6.5, you also
-get full fidelty type inference.
+get full fidelity type inference.
 
 Demo: https://remix-superjson-production.up.railway.app
 
