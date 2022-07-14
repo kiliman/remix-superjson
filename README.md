@@ -10,14 +10,19 @@ Demo: https://remix-superjson-production.up.railway.app
 
 ```ts
 export async function loader({ request }: LoaderArgs) {
+  var url = new URL(request.url)
+  if (url.searchParams.has('redirect')) {
+    return redirect('/', { headers: { 'set-cookie': 'superjson=true' } })
+  }
   return superjson(
     { greeting: 'hello', today: new Date() },
     { headers: { 'x-superjson': 'true' } },
   )
 }
-
 export default function Index() {
   const data = useSuperLoaderData<typeof loader>()
   return <p>Today is {data.today.toLocaleString()}</p>
 }
 ```
+
+<img src="images/screenshot-types.png"/>
