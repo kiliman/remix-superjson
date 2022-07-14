@@ -1,0 +1,508 @@
+diff --git a/node_modules/@remix-run/dev/dist/compiler.js b/node_modules/@remix-run/dev/dist/compiler.js
+index 9d39471..63763ed 100644
+--- a/node_modules/@remix-run/dev/dist/compiler.js
++++ b/node_modules/@remix-run/dev/dist/compiler.js
+@@ -376,6 +376,7 @@ function createServerBuild(config, options, assetsManifestPromiseRef) {
+     platform: config.serverPlatform,
+     format: config.serverModuleFormat,
+     treeShaking: true,
++    metafile: true,
+     // The type of dead code elimination we want to do depends on the
+     // minify syntax property: https://github.com/evanw/esbuild/issues/672#issuecomment-1029682369
+     // Dev builds are leaving code that should be optimized away in the
+@@ -405,6 +406,12 @@ function createServerBuild(config, options, assetsManifestPromiseRef) {
+     plugins
+   }).then(async build => {
+     await writeServerBuildResult(config, build.outputFiles);
++    let analysis = await esbuild.analyzeMetafile(build.metafile, {
++      verbose: true,
++    })
++    var serverBuildDirectory = path__namespace.dirname(config.serverBuildPath)
++    await fs.writeFileSafe(path__namespace.join(serverBuildDirectory, 'meta.json'), JSON.stringify(build.metafile, null, 2));
++    await fs.writeFileSafe(path__namespace.join(serverBuildDirectory, 'bundle-analysis.txt'), analysis);
+     return build;
+   });
+ }
+@@ -414,6 +421,11 @@ async function generateAssetsManifest(config, metafile) {
+   let filename = `manifest-${assetsManifest.version.toUpperCase()}.js`;
+   assetsManifest.url = config.publicPath + filename;
+   await fs.writeFileSafe(path__namespace.join(config.assetsBuildDirectory, filename), `window.__remixManifest=${JSON.stringify(assetsManifest)};`);
++  let analysis = await esbuild.analyzeMetafile(metafile, {
++    verbose: true,
++  })
++  await fs.writeFileSafe(path__namespace.join(config.assetsBuildDirectory, 'meta.json'), JSON.stringify(metafile, null, 2));
++  await fs.writeFileSafe(path__namespace.join(config.assetsBuildDirectory, 'bundle-analysis.txt'), analysis);
+   return assetsManifest;
+ }
+ 
+diff --git a/node_modules/@remix-run/dev/dist/compiler.js.orig b/node_modules/@remix-run/dev/dist/compiler.js.orig
+new file mode 100644
+index 0000000..9d39471
+--- /dev/null
++++ b/node_modules/@remix-run/dev/dist/compiler.js.orig
+@@ -0,0 +1,443 @@
++/**
++ * @remix-run/dev v1.6.5
++ *
++ * Copyright (c) Remix Software Inc.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE.md file in the root directory of this source tree.
++ *
++ * @license MIT
++ */
++'use strict';
++
++Object.defineProperty(exports, '__esModule', { value: true });
++
++var path = require('path');
++var module$1 = require('module');
++var esbuild = require('esbuild');
++var fse = require('fs-extra');
++var debounce = require('lodash.debounce');
++var chokidar = require('chokidar');
++var nodeModulesPolyfill = require('@esbuild-plugins/node-modules-polyfill');
++var esbuildPluginPnp = require('@yarnpkg/esbuild-plugin-pnp');
++var build$1 = require('./build.js');
++var config = require('./config.js');
++var warnings = require('./compiler/warnings.js');
++var assets = require('./compiler/assets.js');
++var dependencies = require('./compiler/dependencies.js');
++var loaders = require('./compiler/loaders.js');
++var browserRouteModulesPlugin = require('./compiler/plugins/browserRouteModulesPlugin.js');
++var emptyModulesPlugin = require('./compiler/plugins/emptyModulesPlugin.js');
++var mdx = require('./compiler/plugins/mdx.js');
++var serverAssetsManifestPlugin = require('./compiler/plugins/serverAssetsManifestPlugin.js');
++var serverBareModulesPlugin = require('./compiler/plugins/serverBareModulesPlugin.js');
++var serverEntryModulePlugin = require('./compiler/plugins/serverEntryModulePlugin.js');
++var serverRouteModulesPlugin = require('./compiler/plugins/serverRouteModulesPlugin.js');
++var fs = require('./compiler/utils/fs.js');
++var urlImportsPlugin = require('./compiler/plugins/urlImportsPlugin.js');
++
++function _interopDefaultLegacy (e) { return e && typeof e === 'object' && 'default' in e ? e : { 'default': e }; }
++
++function _interopNamespace(e) {
++  if (e && e.__esModule) return e;
++  var n = Object.create(null);
++  if (e) {
++    Object.keys(e).forEach(function (k) {
++      if (k !== 'default') {
++        var d = Object.getOwnPropertyDescriptor(e, k);
++        Object.defineProperty(n, k, d.get ? d : {
++          enumerable: true,
++          get: function () { return e[k]; }
++        });
++      }
++    });
++  }
++  n["default"] = e;
++  return Object.freeze(n);
++}
++
++var path__namespace = /*#__PURE__*/_interopNamespace(path);
++var esbuild__namespace = /*#__PURE__*/_interopNamespace(esbuild);
++var fse__namespace = /*#__PURE__*/_interopNamespace(fse);
++var debounce__default = /*#__PURE__*/_interopDefaultLegacy(debounce);
++var chokidar__default = /*#__PURE__*/_interopDefaultLegacy(chokidar);
++
++// directory in the same place relative to this file. It is eventually injected
++// as a source file when building the app.
++
++const reactShim = path__namespace.resolve(__dirname, "compiler/shims/react.ts");
++
++function defaultWarningHandler(message, key) {
++  warnings.warnOnce(message, key);
++}
++
++function defaultBuildFailureHandler(failure) {
++  formatBuildFailure(failure);
++}
++
++function formatBuildFailure(failure) {
++  if ("warnings" in failure || "errors" in failure) {
++    if (failure.warnings) {
++      let messages = esbuild__namespace.formatMessagesSync(failure.warnings, {
++        kind: "warning",
++        color: true
++      });
++      console.warn(...messages);
++    }
++
++    if (failure.errors) {
++      let messages = esbuild__namespace.formatMessagesSync(failure.errors, {
++        kind: "error",
++        color: true
++      });
++      console.error(...messages);
++    }
++  }
++
++  console.error((failure === null || failure === void 0 ? void 0 : failure.message) || "An unknown build error occurred");
++}
++async function build(config, {
++  mode = build$1.BuildMode.Production,
++  target = build$1.BuildTarget.Node14,
++  sourcemap = false,
++  onWarning = defaultWarningHandler,
++  onBuildFailure = defaultBuildFailureHandler
++} = {}) {
++  let assetsManifestPromiseRef = {};
++  await buildEverything(config, assetsManifestPromiseRef, {
++    mode,
++    target,
++    sourcemap,
++    onWarning,
++    onBuildFailure
++  });
++}
++async function watch(config$1, {
++  mode = build$1.BuildMode.Development,
++  target = build$1.BuildTarget.Node14,
++  sourcemap = true,
++  onWarning = defaultWarningHandler,
++  onBuildFailure = defaultBuildFailureHandler,
++  onRebuildStart,
++  onRebuildFinish,
++  onFileCreated,
++  onFileChanged,
++  onFileDeleted,
++  onInitialBuild
++} = {}) {
++  var _config$watchPaths;
++
++  let options = {
++    mode,
++    target,
++    sourcemap,
++    onBuildFailure,
++    onWarning,
++    incremental: true
++  };
++  let assetsManifestPromiseRef = {};
++  let [browserBuild, serverBuild] = await buildEverything(config$1, assetsManifestPromiseRef, options);
++  let initialBuildComplete = !!browserBuild && !!serverBuild;
++
++  if (initialBuildComplete) {
++    onInitialBuild === null || onInitialBuild === void 0 ? void 0 : onInitialBuild();
++  }
++
++  function disposeBuilders() {
++    var _browserBuild, _browserBuild$rebuild, _serverBuild, _serverBuild$rebuild;
++
++    (_browserBuild = browserBuild) === null || _browserBuild === void 0 ? void 0 : (_browserBuild$rebuild = _browserBuild.rebuild) === null || _browserBuild$rebuild === void 0 ? void 0 : _browserBuild$rebuild.dispose();
++    (_serverBuild = serverBuild) === null || _serverBuild === void 0 ? void 0 : (_serverBuild$rebuild = _serverBuild.rebuild) === null || _serverBuild$rebuild === void 0 ? void 0 : _serverBuild$rebuild.dispose();
++    browserBuild = undefined;
++    serverBuild = undefined;
++  }
++
++  let restartBuilders = debounce__default["default"](async newConfig => {
++    disposeBuilders();
++
++    try {
++      newConfig = await config.readConfig(config$1.rootDirectory);
++    } catch (error) {
++      onBuildFailure(error);
++      return;
++    }
++
++    config$1 = newConfig;
++    if (onRebuildStart) onRebuildStart();
++    let builders = await buildEverything(config$1, assetsManifestPromiseRef, options);
++    if (onRebuildFinish) onRebuildFinish();
++    browserBuild = builders[0];
++    serverBuild = builders[1];
++  }, 500);
++  let rebuildEverything = debounce__default["default"](async () => {
++    var _browserBuild2, _serverBuild2;
++
++    if (onRebuildStart) onRebuildStart();
++
++    if (!((_browserBuild2 = browserBuild) !== null && _browserBuild2 !== void 0 && _browserBuild2.rebuild) || !((_serverBuild2 = serverBuild) !== null && _serverBuild2 !== void 0 && _serverBuild2.rebuild)) {
++      disposeBuilders();
++
++      try {
++        [browserBuild, serverBuild] = await buildEverything(config$1, assetsManifestPromiseRef, options);
++
++        if (!initialBuildComplete) {
++          initialBuildComplete = !!browserBuild && !!serverBuild;
++
++          if (initialBuildComplete) {
++            onInitialBuild === null || onInitialBuild === void 0 ? void 0 : onInitialBuild();
++          }
++        }
++
++        if (onRebuildFinish) onRebuildFinish();
++      } catch (err) {
++        onBuildFailure(err);
++      }
++
++      return;
++    } // If we get here and can't call rebuild something went wrong and we
++    // should probably blow as it's not really recoverable.
++
++
++    let browserBuildPromise = browserBuild.rebuild();
++    let assetsManifestPromise = browserBuildPromise.then(build => generateAssetsManifest(config$1, build.metafile)); // Assign the assetsManifestPromise to a ref so the server build can await
++    // it when loading the @remix-run/dev/assets-manifest virtual module.
++
++    assetsManifestPromiseRef.current = assetsManifestPromise;
++    await Promise.all([assetsManifestPromise, serverBuild.rebuild().then(build => writeServerBuildResult(config$1, build.outputFiles))]).catch(err => {
++      disposeBuilders();
++      onBuildFailure(err);
++    });
++    if (onRebuildFinish) onRebuildFinish();
++  }, 100);
++  let toWatch = [config$1.appDirectory];
++
++  if (config$1.serverEntryPoint) {
++    toWatch.push(config$1.serverEntryPoint);
++  }
++
++  (_config$watchPaths = config$1.watchPaths) === null || _config$watchPaths === void 0 ? void 0 : _config$watchPaths.forEach(watchPath => {
++    toWatch.push(watchPath);
++  });
++  let watcher = chokidar__default["default"].watch(toWatch, {
++    persistent: true,
++    ignoreInitial: true,
++    awaitWriteFinish: {
++      stabilityThreshold: 100,
++      pollInterval: 100
++    }
++  }).on("error", error => console.error(error)).on("change", async file => {
++    if (onFileChanged) onFileChanged(file);
++    await rebuildEverything();
++  }).on("add", async file => {
++    if (onFileCreated) onFileCreated(file);
++    let newConfig;
++
++    try {
++      newConfig = await config.readConfig(config$1.rootDirectory);
++    } catch (error) {
++      onBuildFailure(error);
++      return;
++    }
++
++    if (isEntryPoint(newConfig, file)) {
++      await restartBuilders(newConfig);
++    } else {
++      await rebuildEverything();
++    }
++  }).on("unlink", async file => {
++    if (onFileDeleted) onFileDeleted(file);
++
++    if (isEntryPoint(config$1, file)) {
++      await restartBuilders();
++    } else {
++      await rebuildEverything();
++    }
++  });
++  return async () => {
++    await watcher.close().catch(() => {});
++    disposeBuilders();
++  };
++}
++
++function isEntryPoint(config, file) {
++  let appFile = path__namespace.relative(config.appDirectory, file);
++
++  if (appFile === config.entryClientFile || appFile === config.entryServerFile) {
++    return true;
++  }
++
++  for (let key in config.routes) {
++    if (appFile === config.routes[key].file) return true;
++  }
++
++  return false;
++} ///////////////////////////////////////////////////////////////////////////////
++
++
++async function buildEverything(config, assetsManifestPromiseRef, options) {
++  try {
++    let browserBuildPromise = createBrowserBuild(config, options);
++    let assetsManifestPromise = browserBuildPromise.then(build => generateAssetsManifest(config, build.metafile)); // Assign the assetsManifestPromise to a ref so the server build can await
++    // it when loading the @remix-run/dev/assets-manifest virtual module.
++
++    assetsManifestPromiseRef.current = assetsManifestPromise;
++    let serverBuildPromise = createServerBuild(config, options, assetsManifestPromiseRef);
++    return await Promise.all([assetsManifestPromise.then(() => browserBuildPromise), serverBuildPromise]);
++  } catch (err) {
++    options.onBuildFailure(err);
++    return [undefined, undefined];
++  }
++}
++
++async function createBrowserBuild(config, options) {
++  // For the browser build, exclude node built-ins that don't have a
++  // browser-safe alternative installed in node_modules. Nothing should
++  // *actually* be external in the browser build (we want to bundle all deps) so
++  // this is really just making sure we don't accidentally have any dependencies
++  // on node built-ins in browser bundles.
++  let dependencies$1 = Object.keys(dependencies.getAppDependencies(config));
++  let externals = module$1.builtinModules.filter(mod => !dependencies$1.includes(mod));
++  let fakeBuiltins = module$1.builtinModules.filter(mod => dependencies$1.includes(mod));
++
++  if (fakeBuiltins.length > 0) {
++    throw new Error(`It appears you're using a module that is built in to node, but you installed it as a dependency which could cause problems. Please remove ${fakeBuiltins.join(", ")} before continuing.`);
++  }
++
++  let entryPoints = {
++    "entry.client": path__namespace.resolve(config.appDirectory, config.entryClientFile)
++  };
++
++  for (let id of Object.keys(config.routes)) {
++    // All route entry points are virtual modules that will be loaded by the
++    // browserEntryPointsPlugin. This allows us to tree-shake server-only code
++    // that we don't want to run in the browser (i.e. action & loader).
++    entryPoints[id] = path__namespace.resolve(config.appDirectory, config.routes[id].file) + "?browser";
++  }
++
++  let plugins = [urlImportsPlugin.urlImportsPlugin(), mdx.mdxPlugin(config), browserRouteModulesPlugin.browserRouteModulesPlugin(config, /\?browser$/), emptyModulesPlugin.emptyModulesPlugin(config, /\.server(\.[jt]sx?)?$/), nodeModulesPolyfill.NodeModulesPolyfillPlugin(), esbuildPluginPnp.pnpPlugin()];
++  return esbuild__namespace.build({
++    entryPoints,
++    outdir: config.assetsBuildDirectory,
++    platform: "browser",
++    format: "esm",
++    external: externals,
++    inject: config.serverBuildTarget === "deno" ? [] : [reactShim],
++    loader: loaders.loaders,
++    bundle: true,
++    logLevel: "silent",
++    splitting: true,
++    sourcemap: options.sourcemap,
++    metafile: true,
++    incremental: options.incremental,
++    mainFields: ["browser", "module", "main"],
++    treeShaking: true,
++    minify: options.mode === build$1.BuildMode.Production,
++    entryNames: "[dir]/[name]-[hash]",
++    chunkNames: "_shared/[name]-[hash]",
++    assetNames: "_assets/[name]-[hash]",
++    publicPath: config.publicPath,
++    define: {
++      "process.env.NODE_ENV": JSON.stringify(options.mode),
++      "process.env.REMIX_DEV_SERVER_WS_PORT": JSON.stringify(config.devServerPort)
++    },
++    plugins
++  });
++}
++
++function createServerBuild(config, options, assetsManifestPromiseRef) {
++  let stdin;
++  let entryPoints;
++
++  if (config.serverEntryPoint) {
++    entryPoints = [config.serverEntryPoint];
++  } else {
++    stdin = {
++      contents: config.serverBuildTargetEntryModule,
++      resolveDir: config.rootDirectory,
++      loader: "ts"
++    };
++  }
++
++  let isCloudflareRuntime = ["cloudflare-pages", "cloudflare-workers"].includes(config.serverBuildTarget ?? "");
++  let isDenoRuntime = config.serverBuildTarget === "deno";
++  let plugins = [urlImportsPlugin.urlImportsPlugin(), mdx.mdxPlugin(config), emptyModulesPlugin.emptyModulesPlugin(config, /\.client(\.[jt]sx?)?$/), serverRouteModulesPlugin.serverRouteModulesPlugin(config), serverEntryModulePlugin.serverEntryModulePlugin(config), serverAssetsManifestPlugin.serverAssetsManifestPlugin(assetsManifestPromiseRef), serverBareModulesPlugin.serverBareModulesPlugin(config, options.onWarning), esbuildPluginPnp.pnpPlugin()];
++
++  if (config.serverPlatform !== "node") {
++    plugins.unshift(nodeModulesPolyfill.NodeModulesPolyfillPlugin());
++  }
++
++  return esbuild__namespace.build({
++    absWorkingDir: config.rootDirectory,
++    stdin,
++    entryPoints,
++    outfile: config.serverBuildPath,
++    write: false,
++    conditions: isCloudflareRuntime ? ["worker"] : isDenoRuntime ? ["deno", "worker"] : undefined,
++    platform: config.serverPlatform,
++    format: config.serverModuleFormat,
++    treeShaking: true,
++    // The type of dead code elimination we want to do depends on the
++    // minify syntax property: https://github.com/evanw/esbuild/issues/672#issuecomment-1029682369
++    // Dev builds are leaving code that should be optimized away in the
++    // bundle causing server / testing code to be shipped to the browser.
++    // These are properly optimized away in prod builds today, and this
++    // PR makes dev mode behave closer to production in terms of dead
++    // code elimination / tree shaking is concerned.
++    minifySyntax: true,
++    minify: options.mode === build$1.BuildMode.Production && isCloudflareRuntime,
++    mainFields: isCloudflareRuntime ? ["browser", "module", "main"] : config.serverModuleFormat === "esm" ? ["module", "main"] : ["main", "module"],
++    target: options.target,
++    inject: config.serverBuildTarget === "deno" ? [] : [reactShim],
++    loader: loaders.loaders,
++    bundle: true,
++    logLevel: "silent",
++    incremental: options.incremental,
++    sourcemap: options.sourcemap,
++    // use linked (true) to fix up .map file
++    // The server build needs to know how to generate asset URLs for imports
++    // of CSS and other files.
++    assetNames: "_assets/[name]-[hash]",
++    publicPath: config.publicPath,
++    define: {
++      "process.env.NODE_ENV": JSON.stringify(options.mode),
++      "process.env.REMIX_DEV_SERVER_WS_PORT": JSON.stringify(config.devServerPort)
++    },
++    plugins
++  }).then(async build => {
++    await writeServerBuildResult(config, build.outputFiles);
++    return build;
++  });
++}
++
++async function generateAssetsManifest(config, metafile) {
++  let assetsManifest = await assets.createAssetsManifest(config, metafile);
++  let filename = `manifest-${assetsManifest.version.toUpperCase()}.js`;
++  assetsManifest.url = config.publicPath + filename;
++  await fs.writeFileSafe(path__namespace.join(config.assetsBuildDirectory, filename), `window.__remixManifest=${JSON.stringify(assetsManifest)};`);
++  return assetsManifest;
++}
++
++async function writeServerBuildResult(config, outputFiles) {
++  await fse__namespace.ensureDir(path__namespace.dirname(config.serverBuildPath));
++
++  for (let file of outputFiles) {
++    if (file.path.endsWith(".js")) {
++      // fix sourceMappingURL to be relative to current path instead of /build
++      let filename = file.path.substring(file.path.lastIndexOf(path__namespace.sep) + 1);
++      let escapedFilename = filename.replace(/\./g, "\\.");
++      let pattern = `(//# sourceMappingURL=)(.*)${escapedFilename}`;
++      let contents = Buffer.from(file.contents).toString("utf-8");
++      contents = contents.replace(new RegExp(pattern), `$1${filename}`);
++      await fse__namespace.writeFile(file.path, contents);
++    } else if (file.path.endsWith(".map")) {
++      // remove route: prefix from source filenames so breakpoints work
++      let contents = Buffer.from(file.contents).toString("utf-8");
++      contents = contents.replace(/"route:/gm, '"');
++      await fse__namespace.writeFile(file.path, contents);
++    }
++  }
++}
++
++exports.build = build;
++exports.formatBuildFailure = formatBuildFailure;
++exports.watch = watch;
+diff --git a/node_modules/@remix-run/dev/dist/compiler.js.rej b/node_modules/@remix-run/dev/dist/compiler.js.rej
+new file mode 100644
+index 0000000..0124c76
+--- /dev/null
++++ b/node_modules/@remix-run/dev/dist/compiler.js.rej
+@@ -0,0 +1,16 @@
++***************
++*** 371,376 ****
++      platform: config.serverPlatform,
++      format: config.serverModuleFormat,
++      treeShaking: true,
++      minify: options.mode === build$1.BuildMode.Production && isCloudflareRuntime,
++      mainFields: isCloudflareRuntime ? ["browser", "module", "main"] : config.serverModuleFormat === "esm" ? ["module", "main"] : ["main", "module"],
++      target: options.target,
++--- 371,377 ----
++      platform: config.serverPlatform,
++      format: config.serverModuleFormat,
++      treeShaking: true,
+++     metafile: true,
++      minify: options.mode === build$1.BuildMode.Production && isCloudflareRuntime,
++      mainFields: isCloudflareRuntime ? ["browser", "module", "main"] : config.serverModuleFormat === "esm" ? ["module", "main"] : ["main", "module"],
++      target: options.target,
